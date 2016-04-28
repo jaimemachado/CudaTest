@@ -4,32 +4,79 @@
 #include <stdio.h>
 #include <cstdlib>
 
-class ManagedAllocationPolicy {
+#define MULTI_DEVICES
+
+#ifdef MULTI_DEVICES
+#define ENABLE_GPU
+#define ENABLE_CPU
+#define ENABLE_MULTI_DEVICES
+#define MEMORY_ALLOCATOR ManagedAllocationPolicy
+#elif defined GPU_DEVICE
+#define ENABLE_GPU
+#define MEMORY_ALLOCATOR ManagedAllocationPolicy
+#else
+#define ENABLE_CPU
+#define MEMORY_ALLOCATOR DefaultAllocationPolicy
+#endif
+
+enum class DeviceSelector{
+	GPU,
+	CPU
+};
+
+enum class MemType{
+	Mannaged,
+	NotMannaged
+};
+template <typename Allocator>
+class DeviceSelectionPolicyBase : public Allocator {
+	DeviceSelector m_eProcessLocation;
 public:
+	virtual DeviceSelector GetProcessLocation(){
+		return m_eProcessLocation;
+	}
+	bool SetProcessLocation(DeviceSelector location){
+		if (location == DeviceSelector::GPU && GetMemType() == MemType::NotMannaged)
+		{
+			return false;
+		}
+		m_eProcessLocation = location;
+		return true;
+	}
+};
+
+class ManagedAllocationPolicy{
+public:
+	MemType GetMemType(){
+		return MemType::Mannaged;
+	}
 	void* operator new(size_t len){
 		void *ptr;
 		cudaMallocManaged(&ptr, len);
 		return ptr;
 	}
 
-		void operator delete(void *ptr) {
+	void operator delete(void *ptr) {
 		cudaFree(ptr);
 	}
 };
 
-class DefaultAllocationPolicy {
+class DefaultAllocationPolicy{
 public:
+	MemType GetMemType(){
+		return MemType::NotMannaged;
+	}
 	void* operator new(size_t len){
 		return malloc(len);
 	}
 
-		void operator delete(void *ptr) {
+	void operator delete(void *ptr) {
 		free(ptr);
 	}
 };
 
 template <typename Allocator>
-class test : public Allocator
+class test : public DeviceSelectionPolicyBase<Allocator>
 {
 public:
 	int prop3;
@@ -38,23 +85,89 @@ public:
 // C++ now handles our deep copies
 template <typename Allocator>
 //template <typedef Allocator>
-struct dataElem : public Allocator {
+struct dataElem : public DeviceSelectionPolicyBase<Allocator> {
+	DeviceSelector GetProcessLocation(){
+		return m_eProcessLocation;
+	}
+	bool SetProcessLocation(DeviceSelector location){
+		if (!DeviceSelectionPolicyBase::SetProcessLocation(location))
+		{
+			return false;
+		}
+		return propTest.SetProcessLocation(location);
+	}
+
+	dataElem(){
+		if (GetMemType() == MemType::NotMannaged){
+			m_eProcessLocation = DeviceSelector::CPU;
+		}
+		else{
+			m_eProcessLocation = DeviceSelector::GPU;
+		}
+	}
 	int prop1;
 	int prop2;
 	float val;
 	test<Allocator> propTest;
+private:
+	DeviceSelector m_eProcessLocation;
 };
 
 template <typename Allocator>
-__global__ void foo_by_ref(dataElem<Allocator> &e) {
-	printf("Thread %d of %d read prop1=%d, prop2=%d, val=%f, propTest=%d \n",
-		threadIdx.x, blockIdx.x, e.prop1, e.prop2, e.val, e.propTest.prop3);
+__global__ void g_global_foo2(test<Allocator> &e) {
+	g_foo2(e);
 }
 
 template <typename Allocator>
-__global__ void foo_by_val(dataElem<Allocator> e) {
-	printf("Thread %d of %d read prop1=%d, prop2=%d, val=%f, propTest=%d \n",
-		threadIdx.x, blockIdx.x, e.prop1, e.prop2, e.val, e.propTest.prop3);
+__device__ void g_foo2(test<Allocator> &e) {
+	printf("GPU: Thread %d of %d read propTest=%d \n",
+		threadIdx.x, blockIdx.x, e.prop3);
+}
+
+template <typename Allocator>
+void d_foo2(test<Allocator> &e) {
+	printf("CPU: read propTest=%d \n",
+		e.prop3);
+}
+
+template <typename Allocator>
+void foo2(test<Allocator> &e) {
+	if (e.GetProcessLocation() == DeviceSelector::GPU)
+	{
+		g_global_foo2 << <1, 1 >> >(e); // works
+		cudaDeviceSynchronize();
+		printf("%s\n", cudaGetErrorString(cudaGetLastError()));
+	}
+	else{
+		d_foo2(e); // works
+	}
+}
+
+template <typename Allocator>
+__global__ void g_foo(dataElem<Allocator> &e) {
+	printf("GPU: Thread %d of %d read prop1=%d, prop2=%d, val=%f\n",
+		threadIdx.x, blockIdx.x, e.prop1, e.prop2, e.val);
+	g_foo2(e.propTest);
+}
+
+template <typename Allocator>
+void d_foo(dataElem<Allocator> &e) {
+	printf("CPU: read prop1=%d, prop2=%d, val=%f\n",
+		e.prop1, e.prop2, e.val);
+	foo2(e.propTest);
+}
+
+template <typename Allocator>
+void foo(dataElem<Allocator> &e) {
+	if (e.GetProcessLocation() == DeviceSelector::GPU)
+	{
+		g_foo << <1, 1 >> >(e); // works
+		cudaDeviceSynchronize();
+		printf("%s\n", cudaGetErrorString(cudaGetLastError()));
+	}
+	else{
+		d_foo(e); // works
+	}
 }
 
 int main(void) {
@@ -78,19 +191,15 @@ int main(void) {
 	void *ptr;
 	auto a = cudaMallocManaged(&ptr, 10);
 
-	auto *managedElem = new dataElem<ManagedAllocationPolicy>;
+	auto *managedElem = new dataElem<MEMORY_ALLOCATOR>;
 	auto *unmanagedElem = new dataElem<DefaultAllocationPolicy>;
 	managedElem->prop1 = 1; managedElem->prop2 = 2; managedElem->val = 3.0f; managedElem->propTest.prop3 = 4;
-	unmanagedElem->prop1 = 100; unmanagedElem->prop2 = 200; unmanagedElem->val = 300.0f;
+	unmanagedElem->prop1 = 100; unmanagedElem->prop2 = 200; unmanagedElem->val = 300.0f; unmanagedElem->propTest.prop3 = 20;
 
-	foo_by_ref << <1, 1 >> >(*managedElem); // works
-	cudaDeviceSynchronize();
-	printf("%s\n", cudaGetErrorString(cudaGetLastError()));
+	//managedElem->SetProcessLocation(DeviceSelector::CPU);
 
-	foo_by_val << <1, 1 >> >(*managedElem); // works
-	//foo << <1, 1 >> >(*unmanagedElem); // illegal memory access -- attempt to access host mem from device
-	cudaDeviceSynchronize();
-	printf("%s\n", cudaGetErrorString(cudaGetLastError()));
+	foo(*managedElem); // works
+	foo(*unmanagedElem); // illegal memory access -- attempt to access host mem from device
 
 	cudaDeviceReset();
 }
